@@ -1,9 +1,11 @@
 # src/dcf_model/heuristics.py
 
-from dataclasses import dataclass
-from typing import Dict
+from __future__ import annotations
 
-from .auto_metrics import HistoricalMetrics
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+from .auto_metrics import HistoricalMetrics, DataQualityReport
 from .assumptions import (
     DCFAssumptions,
     GrowthAssumptions,
@@ -13,161 +15,174 @@ from .assumptions import (
 
 
 @dataclass
+class AssumptionWarnings:
+    messages: list[str]
+
+
+@dataclass
 class AssumptionSuggestions:
     """Store three scenario suggestion sets."""
     bear: DCFAssumptions
     base: DCFAssumptions
     bull: DCFAssumptions
+    warnings: AssumptionWarnings
 
 
 def suggest_growth_from_metrics(
-    metrics: HistoricalMetrics, years: int = 5
-) -> Dict[str, GrowthAssumptions]:
+    metrics: HistoricalMetrics,
+    quality: DataQualityReport,
+    years: int,
+    *,
+    fallback_growth: float | None = None,
+) -> tuple[Dict[str, GrowthAssumptions], AssumptionWarnings]:
     """
-    Very simple heuristic:
-    - base: a bit below historical 5Y CAGR (if available)
-    - bear: base - 3pp (floored at 0)
-    - bull: base + 3pp
+    Construct bear/base/bull growth assumptions.
+
+    - If metrics.revenue_cagr_5y is available: use it directly as base (or transform if you want).
+    - If not, only use fallback_growth if explicitly provided.
+    - Otherwise, return an empty suggestion dict with warnings.
     """
-    if metrics.revenue_cagr_5y is None:
-        # fallback: generic assumptions
-        base_growth = 0.05
+    warnings: list[str] = []
+
+    if metrics.revenue_cagr_5y is not None:
+        base_growth = metrics.revenue_cagr_5y
+        warnings.append(
+            f"Base revenue growth derived from 5Y CAGR={metrics.revenue_cagr_5y:.2%}. "
+            f"Data quality notes: {quality.notes}"
+        )
+    elif fallback_growth is not None:
+        base_growth = fallback_growth
+        warnings.append(
+            f"No valid 5Y revenue CAGR computed; using explicit fallback_growth={fallback_growth:.2%}. "
+            f"Data quality notes: {quality.notes}"
+        )
     else:
-        # e.g. clamp between 2% and 15%
-        base_growth = max(min(metrics.revenue_cagr_5y * 0.8, 0.15), 0.02)
+        warnings.append(
+            "No valid 5Y revenue CAGR and no fallback_growth provided. "
+            "Growth assumptions not generated."
+        )
+        return {}, AssumptionWarnings(warnings)
 
+    # Here, bear/base/bull are still a modelling choice around base_growth.
     bear_growth = max(base_growth - 0.03, 0.0)
-    bull_growth = min(base_growth + 0.03, 0.20)
+    bull_growth = base_growth + 0.03
 
-    yearly = {i: base_growth for i in range(1, years + 1)}
+    yearly_base = {i: base_growth for i in range(1, years + 1)}
     yearly_bear = {i: bear_growth for i in range(1, years + 1)}
     yearly_bull = {i: bull_growth for i in range(1, years + 1)}
 
-    return {
+    suggestions: Dict[str, GrowthAssumptions] = {
         "bear": GrowthAssumptions(yearly_growth=yearly_bear),
-        "base": GrowthAssumptions(yearly_growth=yearly),
+        "base": GrowthAssumptions(yearly_growth=yearly_base),
         "bull": GrowthAssumptions(yearly_growth=yearly_bull),
     }
 
+    return suggestions, AssumptionWarnings(warnings)
+
 
 def suggest_margins_from_metrics(
-    metrics: HistoricalMetrics, years: int = 5
-) -> Dict[str, MarginAssumptions]:
+    metrics: HistoricalMetrics,
+    quality: DataQualityReport,
+    years: int,
+    *,
+    fallback_margin: float | None = None,
+) -> tuple[Dict[str, MarginAssumptions], AssumptionWarnings]:
     """
-    Simple margin heuristic:
-    - base: around historical avg EBIT margin
-    - bear: a bit lower
-    - bull: a bit higher
-    """
-    if metrics.avg_ebit_margin_5y is None:
-        base_margin = 0.15
-    else:
-        base_margin = metrics.avg_ebit_margin_5y
+    Construct bear/base/bull EBIT margin assumptions.
 
-    bear_margin = max(base_margin - 0.03, 0.05)
-    bull_margin = min(base_margin + 0.03, 0.40)
+    Same philosophy as growth: no internal hardcoded fallback; caller supplies fallback if desired.
+    """
+    warnings: list[str] = []
+
+    if metrics.avg_ebit_margin_5y is not None:
+        base_margin = metrics.avg_ebit_margin_5y
+        warnings.append(
+            f"Base EBIT margin derived from 5Y average={metrics.avg_ebit_margin_5y:.2%}. "
+            f"Data quality notes: {quality.notes}"
+        )
+    elif fallback_margin is not None:
+        base_margin = fallback_margin
+        warnings.append(
+            f"No valid 5Y EBIT margin; using explicit fallback_margin={fallback_margin:.2%}. "
+            f"Data quality notes: {quality.notes}"
+        )
+    else:
+        warnings.append(
+            "No valid 5Y EBIT margin and no fallback_margin provided. "
+            "Margin assumptions not generated."
+        )
+        return {}, AssumptionWarnings(warnings)
+
+    bear_margin = max(base_margin - 0.03, 0.0)
+    bull_margin = base_margin + 0.03
 
     yearly_base = {i: base_margin for i in range(1, years + 1)}
     yearly_bear = {i: bear_margin for i in range(1, years + 1)}
     yearly_bull = {i: bull_margin for i in range(1, years + 1)}
 
-    return {
+    suggestions: Dict[str, MarginAssumptions] = {
         "bear": MarginAssumptions(ebit_margin_by_year=yearly_bear),
         "base": MarginAssumptions(ebit_margin_by_year=yearly_base),
         "bull": MarginAssumptions(ebit_margin_by_year=yearly_bull),
     }
 
-
-def suggest_wacc_and_terminal_growth(
-    country: str = "developed", sector: str = "generic"
-) -> Dict[str, Dict]:
-    """
-    Very rough placeholders – you can refine based on real data later.
-    Returns dictionaries that can be passed into WACCInputs + g.
-    """
-    # Defaults you can calibrate later
-    rf = 0.03
-    erp = 0.05
-
-    if sector.lower() in {"tech", "growth"}:
-        beta = 1.2
-    else:
-        beta = 1.0
-
-    cost_of_debt = rf + 0.02  # simple spread
-    tax_rate = 0.22
-    equity_weight = 0.7
-    debt_weight = 0.3
-
-    # Terminal growth ranges
-    if country.lower() in {"norway", "europe", "developed"}:
-        g_base = 0.02
-    else:
-        g_base = 0.03
-
-    suggestions = {
-        "bear": {
-            "wacc_inputs": WACCInputs(
-                risk_free_rate=rf,
-                beta=beta,
-                equity_risk_premium=erp,
-                cost_of_debt=cost_of_debt,
-                tax_rate=tax_rate,
-                equity_weight=0.6,
-                debt_weight=0.4,
-            ),
-            "terminal_growth": max(g_base - 0.01, 0.0),
-        },
-        "base": {
-            "wacc_inputs": WACCInputs(
-                risk_free_rate=rf,
-                beta=beta,
-                equity_risk_premium=erp,
-                cost_of_debt=cost_of_debt,
-                tax_rate=tax_rate,
-                equity_weight=0.7,
-                debt_weight=0.3,
-            ),
-            "terminal_growth": g_base,
-        },
-        "bull": {
-            "wacc_inputs": WACCInputs(
-                risk_free_rate=rf,
-                beta=beta,
-                equity_risk_premium=erp,
-                cost_of_debt=cost_of_debt,
-                tax_rate=tax_rate,
-                equity_weight=0.8,
-                debt_weight=0.2,
-            ),
-            "terminal_growth": g_base + 0.005,
-        },
-    }
-
-    return suggestions
+    return suggestions, AssumptionWarnings(warnings)
 
 
 def build_assumption_suggestions(
     metrics: HistoricalMetrics,
-    years: int = 5,
-    country: str = "developed",
-    sector: str = "generic",
+    quality: DataQualityReport,
+    years: int,
+    *,
+    wacc_inputs_bear: WACCInputs,
+    wacc_inputs_base: WACCInputs,
+    wacc_inputs_bull: WACCInputs,
+    terminal_growth_bear: float,
+    terminal_growth_base: float,
+    terminal_growth_bull: float,
+    fallback_growth: float | None = None,
+    fallback_margin: float | None = None,
 ) -> AssumptionSuggestions:
-    growth = suggest_growth_from_metrics(metrics, years=years)
-    margins = suggest_margins_from_metrics(metrics, years=years)
-    wacc_and_g = suggest_wacc_and_terminal_growth(country=country, sector=sector)
+    """
+    High-level helper to combine growth, margin, and WACC/terminal g into DCFAssumptions
+    for bear/base/bull, with explicit inputs for all WACC/terminal choices.
 
-    def make_scenario(name: str) -> DCFAssumptions:
-        wg = wacc_and_g[name]
-        return DCFAssumptions(
-            growth=growth[name],
-            margins=margins[name],
-            wacc_inputs=wg["wacc_inputs"],
-            terminal_growth=wg["terminal_growth"],
+    There are no hardcoded numeric defaults here; all WACC/terminal parameters
+    must be passed in explicitly by the caller.
+    """
+    growth_suggestions, growth_warn = suggest_growth_from_metrics(
+        metrics, quality, years, fallback_growth=fallback_growth
+    )
+    margin_suggestions, margin_warn = suggest_margins_from_metrics(
+        metrics, quality, years, fallback_margin=fallback_margin
+    )
+
+    warnings = AssumptionWarnings(messages=[*growth_warn.messages, *margin_warn.messages])
+
+    if not growth_suggestions or not margin_suggestions:
+        # Let the caller decide how to handle "no suggestions".
+        raise ValueError(
+            "Could not generate growth/margin suggestions; see warnings for details: "
+            f"{warnings.messages}"
         )
 
-    return AssumptionSuggestions(
-        bear=make_scenario("bear"),
-        base=make_scenario("base"),
-        bull=make_scenario("bull"),
+    bear = DCFAssumptions(
+        growth=growth_suggestions["bear"],
+        margins=margin_suggestions["bear"],
+        wacc_inputs=wacc_inputs_bear,
+        terminal_growth=terminal_growth_bear,
     )
+    base = DCFAssumptions(
+        growth=growth_suggestions["base"],
+        margins=margin_suggestions["base"],
+        wacc_inputs=wacc_inputs_base,
+        terminal_growth=terminal_growth_base,
+    )
+    bull = DCFAssumptions(
+        growth=growth_suggestions["bull"],
+        margins=margin_suggestions["bull"],
+        wacc_inputs=wacc_inputs_bull,
+        terminal_growth=terminal_growth_bull,
+    )
+
+    return AssumptionSuggestions(bear=bear, base=base, bull=bull, warnings=warnings)
